@@ -3,7 +3,7 @@
   "type": "module",
   "scripts": {
     "dev": "nodemon --exec tsx server.ts",
-    "build": "tsc",
+    "build": "tsc && cp -r proto dist/proto",
     "start": "node dist/server.js"
   },
   "dependencies": {
