@@ -6,6 +6,8 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { encodePathList, encodeMarkerList } from './protobuf.js';
+import { hashPassword, verifyPassword, signToken, requireAuth, AuthRequest } from './auth.js';
+import jwt from 'jsonwebtoken';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -46,6 +48,156 @@ app.listen(port, () => {
   console.log(`Server listening on port ${port}`);
 });
 
+// --- Auth endpoints ---
+
+app.post('/auth/register', async (req, res) => {
+  try {
+    const { email, password, name } = req.body;
+    const isValid = typeof email === 'string' && typeof password === 'string' && password.length >= 6;
+    if (!isValid) {
+      res.status(400).json({ error: 'email and password (min 6 chars) are required' });
+      return;
+    }
+
+    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    const emailTaken = existing.rows.length > 0;
+    if (emailTaken) {
+      res.status(409).json({ error: 'Email already registered' });
+      return;
+    }
+
+    const passwordHash = await hashPassword(password);
+    const displayName = name || email.split('@')[0];
+    const result = await pool.query(
+      `INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3)
+       RETURNING id, name, email,
+       CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url`,
+      [displayName, email, passwordHash]
+    );
+    const user = result.rows[0];
+    const token = signToken(user.id);
+    res.status(201).json({ token, user });
+  } catch (err) {
+    res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+app.post('/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const isValid = typeof email === 'string' && typeof password === 'string';
+    if (!isValid) {
+      res.status(400).json({ error: 'email and password are required' });
+      return;
+    }
+
+    const result = await pool.query(
+      `SELECT id, name, email, password_hash,
+       CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url
+       FROM users WHERE email = $1`,
+      [email]
+    );
+    const user = result.rows[0];
+    const userNotFound = !user || !user.password_hash;
+    if (userNotFound) {
+      res.status(401).json({ error: 'Invalid email or password' });
+      return;
+    }
+
+    const passwordValid = await verifyPassword(password, user.password_hash);
+    if (!passwordValid) {
+      res.status(401).json({ error: 'Invalid email or password' });
+      return;
+    }
+
+    const token = signToken(user.id);
+    const { password_hash: _, ...safeUser } = user;
+    res.json({ token, user: safeUser });
+  } catch (err) {
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+app.post('/auth/apple', async (req, res) => {
+  try {
+    const { identity_token, name } = req.body;
+    const hasToken = typeof identity_token === 'string';
+    if (!hasToken) {
+      res.status(400).json({ error: 'identity_token is required' });
+      return;
+    }
+
+    // Decode Apple identity token (JWT) without verifying Apple's signature
+    // In production you'd verify against Apple's public keys
+    const decoded = jwt.decode(identity_token) as { sub?: string; email?: string } | null;
+    const isValidAppleToken = decoded?.sub;
+    if (!isValidAppleToken) {
+      res.status(400).json({ error: 'Invalid identity token' });
+      return;
+    }
+
+    const appleId = decoded!.sub!;
+    const appleEmail = decoded!.email;
+
+    // Check if user already linked by apple_id
+    let userResult = await pool.query(
+      `SELECT id, name, email,
+       CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url
+       FROM users WHERE apple_id = $1`,
+      [appleId]
+    );
+
+    // If not found by apple_id, try by email and link the Apple ID
+    const notFoundByApple = userResult.rows.length === 0 && appleEmail;
+    if (notFoundByApple) {
+      userResult = await pool.query(
+        `UPDATE users SET apple_id = $1 WHERE email = $2
+         RETURNING id, name, email,
+         CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url`,
+        [appleId, appleEmail]
+      );
+    }
+
+    // If still no user, create a new one
+    const needsCreate = userResult.rows.length === 0;
+    if (needsCreate) {
+      const displayName = name || appleEmail?.split('@')[0] || 'User';
+      userResult = await pool.query(
+        `INSERT INTO users (name, email, apple_id) VALUES ($1, $2, $3)
+         RETURNING id, name, email,
+         CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url`,
+        [displayName, appleEmail, appleId]
+      );
+    }
+
+    const user = userResult.rows[0];
+    const token = signToken(user.id);
+    res.json({ token, user });
+  } catch (err) {
+    res.status(500).json({ error: 'Apple sign-in failed' });
+  }
+});
+
+app.get('/auth/me', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, email,
+       CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url,
+       total_paths, total_distance_meters, total_duration_seconds
+       FROM users WHERE id = $1`,
+      [req.userId]
+    );
+    const userNotFound = result.rows.length === 0;
+    if (userNotFound) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch user' });
+  }
+});
+
 const PATH_SELECT = `SELECT p.id, p.user_id, u.name AS user_name,
   CASE WHEN u.avatar_filename IS NOT NULL THEN '/uploads/' || u.avatar_filename END AS user_avatar_url,
   ST_AsGeoJSON(p.path) AS path,
@@ -60,14 +212,14 @@ function parsePaths(rows: any[]) {
   return rows;
 }
 
-app.post('/paths', async (req, res) => {
+app.post('/paths', requireAuth, async (req: AuthRequest, res) => {
   try {
-    const { user_id, coordinates, started_at, ended_at, description, litter_level } = req.body;
+    const { coordinates, started_at, ended_at, description, litter_level } = req.body;
     if (!coordinates || !Array.isArray(coordinates) || coordinates.length < 2) {
       return res.status(400).json({ error: 'coordinates array with at least 2 points is required' });
     }
     const geojson = JSON.stringify({ type: 'LineString', coordinates });
-    const uid = user_id || 1;
+    const uid = req.userId!;
     const result = await pool.query(
       `INSERT INTO paths (user_id, path, started_at, ended_at, description, litter_level)
        VALUES ($1, ST_SetSRID(ST_GeomFromGeoJSON($2), 4326), $3, $4, $5, $6)
@@ -129,8 +281,14 @@ app.get('/paths/:id', async (req, res) => {
   }
 });
 
-app.delete('/paths/:id', async (req, res) => {
+app.delete('/paths/:id', requireAuth, async (req: AuthRequest, res) => {
   try {
+    const ownerCheck = await pool.query('SELECT user_id FROM paths WHERE id = $1', [req.params.id]);
+    const pathNotFound = ownerCheck.rows.length === 0;
+    if (pathNotFound) return res.status(404).json({ error: 'Path not found' });
+    const isOwner = ownerCheck.rows[0].user_id === req.userId;
+    if (!isOwner) return res.status(403).json({ error: 'Not authorized' });
+
     await pool.query('DELETE FROM path_photos WHERE path_id = $1', [req.params.id]);
     const result = await pool.query(
       `DELETE FROM paths WHERE id = $1
@@ -154,7 +312,7 @@ app.delete('/paths/:id', async (req, res) => {
   }
 });
 
-app.put('/paths/:id', async (req, res) => {
+app.put('/paths/:id', requireAuth, async (req: AuthRequest, res) => {
   try {
     const { description, litter_level } = req.body;
     const result = await pool.query(
@@ -172,7 +330,7 @@ app.put('/paths/:id', async (req, res) => {
   }
 });
 
-app.post('/paths/:id/photos', upload.array('photos', 10), async (req, res) => {
+app.post('/paths/:id/photos', requireAuth, upload.array('photos', 10), async (req: AuthRequest, res) => {
   try {
     const files = req.files as Express.Multer.File[];
     if (!files || files.length === 0) return res.status(400).json({ error: 'No files uploaded' });
@@ -208,11 +366,11 @@ app.get('/users/:id', async (req, res) => {
   }
 });
 
-app.put('/users/:id', async (req, res) => {
+app.put('/users/:id', requireAuth, async (req: AuthRequest, res) => {
   try {
     const { name } = req.body;
     if (typeof name !== 'string') return res.status(400).json({ error: 'name is required' });
-    const result = await pool.query('UPDATE users SET name = $1 WHERE id = $2 RETURNING id, name, created_at', [name, req.params.id]);
+    const result = await pool.query('UPDATE users SET name = $1 WHERE id = $2 RETURNING id, name, created_at', [name, req.userId]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
     res.json(result.rows[0]);
   } catch (err) {
@@ -220,13 +378,13 @@ app.put('/users/:id', async (req, res) => {
   }
 });
 
-app.post('/users/:id/avatar', upload.single('avatar'), async (req, res) => {
+app.post('/users/:id/avatar', requireAuth, upload.single('avatar'), async (req: AuthRequest, res) => {
   try {
     const file = req.file;
     if (!file) return res.status(400).json({ error: 'No file uploaded' });
     const result = await pool.query(
       'UPDATE users SET avatar_filename = $1 WHERE id = $2 RETURNING id, name',
-      [file.filename, req.params.id]
+      [file.filename, req.userId]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
     res.json({ avatar_url: `/uploads/${file.filename}` });
@@ -247,7 +405,7 @@ app.get('/users/:id/paths', async (req, res) => {
   }
 });
 
-app.post('/markers', async (req, res) => {
+app.post('/markers', requireAuth, async (req: AuthRequest, res) => {
   try {
     const { latitude, longitude, amenity } = req.body;
     const hasRequiredFields = typeof latitude === 'number' && typeof longitude === 'number';
