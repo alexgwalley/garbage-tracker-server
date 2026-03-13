@@ -67,13 +67,26 @@ app.post('/paths', async (req, res) => {
       return res.status(400).json({ error: 'coordinates array with at least 2 points is required' });
     }
     const geojson = JSON.stringify({ type: 'LineString', coordinates });
+    const uid = user_id || 1;
     const result = await pool.query(
       `INSERT INTO paths (user_id, path, started_at, ended_at, description, litter_level)
        VALUES ($1, ST_SetSRID(ST_GeomFromGeoJSON($2), 4326), $3, $4, $5, $6)
-       RETURNING id`,
-      [user_id || 1, geojson, started_at, ended_at, description || null, litter_level || null]
+       RETURNING id, ST_Length(path::geography) AS distance_meters`,
+      [uid, geojson, started_at, ended_at, description || null, litter_level || null]
     );
-    res.status(201).json(result.rows[0]);
+    const row = result.rows[0];
+    const durationSeconds = (started_at && ended_at)
+      ? (new Date(ended_at).getTime() - new Date(started_at).getTime()) / 1000
+      : 0;
+    await pool.query(
+      `UPDATE users SET
+        total_paths = total_paths + 1,
+        total_distance_meters = total_distance_meters + $1,
+        total_duration_seconds = total_duration_seconds + $2
+       WHERE id = $3`,
+      [row.distance_meters, durationSeconds, uid]
+    );
+    res.status(201).json({ id: row.id });
   } catch (err) {
     res.status(500).json({ err });
   }
@@ -119,8 +132,22 @@ app.get('/paths/:id', async (req, res) => {
 app.delete('/paths/:id', async (req, res) => {
   try {
     await pool.query('DELETE FROM path_photos WHERE path_id = $1', [req.params.id]);
-    const result = await pool.query('DELETE FROM paths WHERE id = $1 RETURNING id', [req.params.id]);
+    const result = await pool.query(
+      `DELETE FROM paths WHERE id = $1
+       RETURNING id, user_id, ST_Length(path::geography) AS distance_meters,
+       COALESCE(EXTRACT(EPOCH FROM (ended_at - started_at)), 0)::float AS duration_seconds`,
+      [req.params.id]
+    );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Path not found' });
+    const deleted = result.rows[0];
+    await pool.query(
+      `UPDATE users SET
+        total_paths = GREATEST(total_paths - 1, 0),
+        total_distance_meters = GREATEST(total_distance_meters - $1, 0),
+        total_duration_seconds = GREATEST(total_duration_seconds - $2, 0)
+       WHERE id = $3`,
+      [deleted.distance_meters, deleted.duration_seconds, deleted.user_id]
+    );
     res.json({ deleted: true });
   } catch (err) {
     res.status(500).json({ err });
@@ -168,18 +195,14 @@ app.post('/paths/:id/photos', upload.array('photos', 10), async (req, res) => {
 app.get('/users/:id', async (req, res) => {
   try {
     const userResult = await pool.query(
-      `SELECT id, name, CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url, created_at FROM users WHERE id = $1`,
+      `SELECT id, name,
+        CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url,
+        created_at, total_paths, total_distance_meters, total_duration_seconds
+       FROM users WHERE id = $1`,
       [req.params.id]
     );
     if (userResult.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-    const statsResult = await pool.query(
-      `SELECT COUNT(*)::int AS total_paths,
-       COALESCE(SUM(ST_Length(path::geography)), 0) AS total_distance_meters,
-       COALESCE(EXTRACT(EPOCH FROM SUM(ended_at - started_at)), 0)::float AS total_duration_seconds
-       FROM paths WHERE user_id = $1`,
-      [req.params.id]
-    );
-    res.json({ ...userResult.rows[0], ...statsResult.rows[0] });
+    res.json(userResult.rows[0]);
   } catch (err) {
     res.status(500).json({ err });
   }
