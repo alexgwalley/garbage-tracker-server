@@ -6,7 +6,8 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { encodePathList, encodeMarkerList } from './protobuf.js';
-import { hashPassword, verifyPassword, signToken, requireAuth, AuthRequest } from './auth.js';
+import { hashPassword, verifyPassword, signToken, requireAuth, AuthRequest, generateVerificationCode } from './auth.js';
+import { sendVerificationEmail } from './email.js';
 import jwt from 'jsonwebtoken';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -68,14 +69,16 @@ app.post('/auth/register', async (req, res) => {
 
     const passwordHash = await hashPassword(password);
     const displayName = name || email.split('@')[0];
+    const verificationCode = generateVerificationCode();
     const result = await pool.query(
-      `INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3)
-       RETURNING id, name, email,
+      `INSERT INTO users (name, email, password_hash, verification_token) VALUES ($1, $2, $3, $4)
+       RETURNING id, name, email, email_verified,
        CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url`,
-      [displayName, email, passwordHash]
+      [displayName, email, passwordHash, verificationCode]
     );
     const user = result.rows[0];
     const token = signToken(user.id);
+    await sendVerificationEmail(email, verificationCode);
     res.status(201).json({ token, user });
   } catch (err) {
     res.status(500).json({ error: 'Registration failed' });
@@ -92,7 +95,7 @@ app.post('/auth/login', async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT id, name, email, password_hash,
+      `SELECT id, name, email, password_hash, email_verified,
        CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url
        FROM users WHERE email = $1`,
       [email]
@@ -141,7 +144,7 @@ app.post('/auth/apple', async (req, res) => {
 
     // Check if user already linked by apple_id
     let userResult = await pool.query(
-      `SELECT id, name, email,
+      `SELECT id, name, email, email_verified,
        CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url
        FROM users WHERE apple_id = $1`,
       [appleId]
@@ -151,8 +154,8 @@ app.post('/auth/apple', async (req, res) => {
     const notFoundByApple = userResult.rows.length === 0 && appleEmail;
     if (notFoundByApple) {
       userResult = await pool.query(
-        `UPDATE users SET apple_id = $1 WHERE email = $2
-         RETURNING id, name, email,
+        `UPDATE users SET apple_id = $1, email_verified = TRUE WHERE email = $2
+         RETURNING id, name, email, email_verified,
          CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url`,
         [appleId, appleEmail]
       );
@@ -163,11 +166,19 @@ app.post('/auth/apple', async (req, res) => {
     if (needsCreate) {
       const displayName = name || appleEmail?.split('@')[0] || 'User';
       userResult = await pool.query(
-        `INSERT INTO users (name, email, apple_id) VALUES ($1, $2, $3)
-         RETURNING id, name, email,
+        `INSERT INTO users (name, email, apple_id, email_verified) VALUES ($1, $2, $3, TRUE)
+         RETURNING id, name, email, email_verified,
          CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url`,
         [displayName, appleEmail, appleId]
       );
+    }
+
+    // Ensure Apple users are always verified
+    const appleUser = userResult.rows[0];
+    const needsVerify = appleUser && !appleUser.email_verified;
+    if (needsVerify) {
+      await pool.query('UPDATE users SET email_verified = TRUE WHERE id = $1', [appleUser.id]);
+      appleUser.email_verified = true;
     }
 
     const user = userResult.rows[0];
@@ -181,7 +192,7 @@ app.post('/auth/apple', async (req, res) => {
 app.get('/auth/me', requireAuth, async (req: AuthRequest, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, name, email,
+      `SELECT id, name, email, email_verified,
        CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url,
        total_paths, total_distance_meters, total_duration_seconds
        FROM users WHERE id = $1`,
@@ -195,6 +206,79 @@ app.get('/auth/me', requireAuth, async (req: AuthRequest, res) => {
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch user' });
+  }
+});
+
+app.post('/auth/verify', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const { code } = req.body;
+    const isValid = typeof code === 'string' && code.length === 6;
+    if (!isValid) {
+      res.status(400).json({ error: 'A 6-digit code is required' });
+      return;
+    }
+
+    const result = await pool.query(
+      'SELECT verification_token, email_verified FROM users WHERE id = $1',
+      [req.userId]
+    );
+    const user = result.rows[0];
+    const userNotFound = !user;
+    if (userNotFound) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+
+    const alreadyVerified = user.email_verified;
+    if (alreadyVerified) {
+      res.json({ email_verified: true });
+      return;
+    }
+
+    const codeMatches = user.verification_token === code;
+    if (!codeMatches) {
+      res.status(400).json({ error: 'Invalid verification code' });
+      return;
+    }
+
+    await pool.query(
+      'UPDATE users SET email_verified = TRUE, verification_token = NULL WHERE id = $1',
+      [req.userId]
+    );
+    res.json({ email_verified: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Verification failed' });
+  }
+});
+
+app.post('/auth/resend-verification', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT email, email_verified FROM users WHERE id = $1',
+      [req.userId]
+    );
+    const user = result.rows[0];
+    const userNotFound = !user;
+    if (userNotFound) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+
+    const alreadyVerified = user.email_verified;
+    if (alreadyVerified) {
+      res.json({ message: 'Already verified' });
+      return;
+    }
+
+    const newCode = generateVerificationCode();
+    await pool.query(
+      'UPDATE users SET verification_token = $1 WHERE id = $2',
+      [newCode, req.userId]
+    );
+    await sendVerificationEmail(user.email, newCode);
+    res.json({ message: 'Verification email sent' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to resend verification' });
   }
 });
 

@@ -1,5 +1,6 @@
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 import { Request, Response, NextFunction } from 'express';
 
 const SALT_ROUNDS = 10;
@@ -30,6 +31,11 @@ export function signToken(userId: number): string {
 
 export interface AuthRequest extends Request {
     userId?: number;
+}
+
+export function generateVerificationCode(): string {
+    const code = crypto.randomInt(100000, 999999).toString();
+    return code;
 }
 
 export function requireAuth(req: AuthRequest, res: Response, next: NextFunction): void {

@@ -8,5 +8,5 @@
     "strict": true,
     "skipLibCheck": true
   },
-  "include": ["server.ts", "protobuf.ts", "auth.ts"]
+  "include": ["server.ts", "protobuf.ts", "auth.ts", "email.ts"]
 }
