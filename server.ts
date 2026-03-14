@@ -6,19 +6,19 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { encodePathList, encodeMarkerList } from './protobuf.js';
-import { hashPassword, verifyPassword, signToken, requireAuth, AuthRequest, generateVerificationCode } from './auth.js';
+import { hashPassword, verifyPassword, signToken, requireAuth, AuthRequest, generateVerificationCode, SafeResult } from './auth.js';
 import { sendVerificationEmail } from './email.js';
 import jwt from 'jsonwebtoken';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const app = express();
+export const app = express();
 const port = process.env.PORT || 3000;
 
 app.use(express.json());
 
 const uploadsDir = process.env.RAILWAY_VOLUME_MOUNT_PATH
-    ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'uploads')
-    : path.join(__dirname, 'uploads');
+  ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'uploads')
+  : path.join(__dirname, 'uploads');
 
 fs.mkdirSync(uploadsDir, { recursive: true });
 
@@ -41,245 +41,341 @@ const pool = new pg.Pool({
   ssl: isProduction ? { rejectUnauthorized: false } : false,
 });
 
+async function safeQuery(text: string, params?: any[]): Promise<SafeResult<pg.QueryResult>> {
+  let value: pg.QueryResult = { rows: [], rowCount: 0, command: '', oid: 0, fields: [] };
+  let error: string | null = null;
+  try {
+    value = await pool.query(text, params);
+  } catch (err) {
+    error = `Query failed: ${err}`;
+  }
+  const result: SafeResult<pg.QueryResult> = { value, error };
+  return result;
+}
+
 app.get('/', (req, res) => {
   res.send('Hello There! The server is running.');
 });
 
-app.listen(port, () => {
-  console.log(`Server listening on port ${port}`);
-});
+const isDirectRun = process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/\\/g, '/'));
+if (isDirectRun) {
+  app.listen(port, () => {
+    console.log(`Server listening on port ${port}`);
+  });
+}
 
 // --- Auth endpoints ---
 
 app.post('/auth/register', async (req, res) => {
-  try {
-    const { email, password, name } = req.body;
-    const isValid = typeof email === 'string' && typeof password === 'string' && password.length >= 6;
-    if (!isValid) {
-      res.status(400).json({ error: 'email and password (min 6 chars) are required' });
-      return;
-    }
+  let responseStatus = 0;
+  let responseBody: any = null;
 
-    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
-    const emailTaken = existing.rows.length > 0;
-    if (emailTaken) {
-      res.status(409).json({ error: 'Email already registered' });
-      return;
-    }
+  const { email, password, name } = req.body;
 
-    const passwordHash = await hashPassword(password);
-    const displayName = name || email.split('@')[0];
-    const verificationCode = generateVerificationCode();
-    const result = await pool.query(
-      `INSERT INTO users (name, email, password_hash, verification_token) VALUES ($1, $2, $3, $4)
-       RETURNING id, name, email, email_verified,
-       CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url`,
-      [displayName, email, passwordHash, verificationCode]
-    );
-    const user = result.rows[0];
-    const token = signToken(user.id);
-    await sendVerificationEmail(email, verificationCode);
-    res.status(201).json({ token, user });
-  } catch (err) {
-    res.status(500).json({ error: 'Registration failed' });
+  const existing = await safeQuery('SELECT id FROM users WHERE email = $1', [email]);
+  if (existing.error) {
+    responseStatus = 500;
+    responseBody = { error: 'Registration failed' };
   }
+
+  const emailTaken = responseStatus === 0 && existing.value.rows.length > 0;
+  if (emailTaken) {
+    responseStatus = 409;
+    responseBody = { error: 'Email already registered' };
+  }
+
+  if (responseStatus === 0) {
+    const hashed = await hashPassword(password);
+    if (hashed.error) {
+      responseStatus = 500;
+      responseBody = { error: 'Registration failed' };
+    }
+
+    if (responseStatus === 0) {
+      const displayName = name || email.split('@')[0];
+      const verificationCode = generateVerificationCode();
+      const inserted = await safeQuery(
+        `INSERT INTO users (name, email, password_hash, verification_token) VALUES ($1, $2, $3, $4)
+         RETURNING id, name, email, email_verified,
+         CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url`,
+        [displayName, email, hashed.value, verificationCode]
+      );
+
+      if (inserted.error) {
+        responseStatus = 500;
+        responseBody = { error: 'Registration failed' };
+      }
+
+      if (responseStatus === 0) {
+        const user = inserted.value.rows[0];
+        const token = signToken(user.id);
+        await sendVerificationEmail(email, verificationCode);
+        responseStatus = 201;
+        responseBody = { token, user };
+      }
+    }
+  }
+
+  res.status(responseStatus).json(responseBody);
 });
 
 app.post('/auth/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    const isValid = typeof email === 'string' && typeof password === 'string';
-    if (!isValid) {
-      res.status(400).json({ error: 'email and password are required' });
-      return;
-    }
+  let responseStatus = 0;
+  let responseBody: any = null;
 
-    const result = await pool.query(
-      `SELECT id, name, email, password_hash, email_verified,
-       CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url
-       FROM users WHERE email = $1`,
-      [email]
-    );
-    const user = result.rows[0];
-    const userNotFound = !user || !user.password_hash;
-    if (userNotFound) {
-      res.status(401).json({ error: 'Invalid email or password' });
-      return;
-    }
+  const { email, password } = req.body;
 
-    const passwordValid = await verifyPassword(password, user.password_hash);
-    if (!passwordValid) {
-      res.status(401).json({ error: 'Invalid email or password' });
-      return;
-    }
-
-    const token = signToken(user.id);
-    const { password_hash: _, ...safeUser } = user;
-    res.json({ token, user: safeUser });
-  } catch (err) {
-    res.status(500).json({ error: 'Login failed' });
+  const result = await safeQuery(
+    `SELECT id, name, email, password_hash, email_verified,
+     CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url
+     FROM users WHERE email = $1`,
+    [email]
+  );
+  if (result.error) {
+    responseStatus = 500;
+    responseBody = { error: 'Login failed' };
   }
+
+  if (responseStatus === 0) {
+    const user = result.value.rows[0];
+    const userNotFound = !user || !user.password_hash;
+
+    if (userNotFound) {
+      responseStatus = 401;
+      responseBody = { error: 'Invalid email or password' };
+    }
+
+    if (responseStatus === 0) {
+      const verified = await verifyPassword(password, user.password_hash);
+      if (verified.error || !verified.value) {
+        responseStatus = 401;
+        responseBody = { error: 'Invalid email or password' };
+      }
+    }
+
+    if (responseStatus === 0) {
+      const token = signToken(user.id);
+      const { password_hash: _, ...safeUser } = user;
+      responseStatus = 200;
+      responseBody = { token, user: safeUser };
+    }
+  }
+
+  res.status(responseStatus).json(responseBody);
 });
 
 app.post('/auth/apple', async (req, res) => {
-  try {
-    const { identity_token, name } = req.body;
-    const hasToken = typeof identity_token === 'string';
-    if (!hasToken) {
-      res.status(400).json({ error: 'identity_token is required' });
-      return;
-    }
+  let responseStatus = 0;
+  let responseBody: any = null;
 
-    // Decode Apple identity token (JWT) without verifying Apple's signature
-    // In production you'd verify against Apple's public keys
-    const decoded = jwt.decode(identity_token) as { sub?: string; email?: string } | null;
-    const isValidAppleToken = decoded?.sub;
-    if (!isValidAppleToken) {
-      res.status(400).json({ error: 'Invalid identity token' });
-      return;
-    }
+  const { identity_token, name } = req.body;
 
+  const decoded = jwt.decode(identity_token) as { sub?: string; email?: string } | null;
+  const isValidAppleToken = decoded?.sub;
+  if (!isValidAppleToken) {
+    responseStatus = 400;
+    responseBody = { error: 'Invalid identity token' };
+  }
+
+  if (responseStatus === 0) {
     const appleId = decoded!.sub!;
     const appleEmail = decoded!.email;
 
-    // Check if user already linked by apple_id
-    let userResult = await pool.query(
+    let userResult = await safeQuery(
       `SELECT id, name, email, email_verified,
        CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url
        FROM users WHERE apple_id = $1`,
       [appleId]
     );
+    if (userResult.error) {
+      responseStatus = 500;
+      responseBody = { error: 'Apple sign-in failed' };
+    }
 
     // If not found by apple_id, try by email and link the Apple ID
-    const notFoundByApple = userResult.rows.length === 0 && appleEmail;
+    const notFoundByApple = responseStatus === 0 && userResult.value.rows.length === 0 && appleEmail;
     if (notFoundByApple) {
-      userResult = await pool.query(
+      userResult = await safeQuery(
         `UPDATE users SET apple_id = $1, email_verified = TRUE WHERE email = $2
          RETURNING id, name, email, email_verified,
          CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url`,
         [appleId, appleEmail]
       );
+      if (userResult.error) {
+        responseStatus = 500;
+        responseBody = { error: 'Apple sign-in failed' };
+      }
     }
 
     // If still no user, create a new one
-    const needsCreate = userResult.rows.length === 0;
+    const needsCreate = responseStatus === 0 && userResult.value.rows.length === 0;
     if (needsCreate) {
       const displayName = name || appleEmail?.split('@')[0] || 'User';
-      userResult = await pool.query(
+      userResult = await safeQuery(
         `INSERT INTO users (name, email, apple_id, email_verified) VALUES ($1, $2, $3, TRUE)
          RETURNING id, name, email, email_verified,
          CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url`,
         [displayName, appleEmail, appleId]
       );
+      if (userResult.error) {
+        responseStatus = 500;
+        responseBody = { error: 'Apple sign-in failed' };
+      }
     }
 
-    // Ensure Apple users are always verified
-    const appleUser = userResult.rows[0];
-    const needsVerify = appleUser && !appleUser.email_verified;
-    if (needsVerify) {
-      await pool.query('UPDATE users SET email_verified = TRUE WHERE id = $1', [appleUser.id]);
-      appleUser.email_verified = true;
-    }
+    if (responseStatus === 0) {
+      // Ensure Apple users are always verified
+      const appleUser = userResult.value.rows[0];
+      const needsVerify = appleUser && !appleUser.email_verified;
+      if (needsVerify) {
+        await safeQuery('UPDATE users SET email_verified = TRUE WHERE id = $1', [appleUser.id]);
+        appleUser.email_verified = true;
+      }
 
-    const user = userResult.rows[0];
-    const token = signToken(user.id);
-    res.json({ token, user });
-  } catch (err) {
-    res.status(500).json({ error: 'Apple sign-in failed' });
+      const user = userResult.value.rows[0];
+      const token = signToken(user.id);
+      responseStatus = 200;
+      responseBody = { token, user };
+    }
   }
+
+  res.status(responseStatus).json(responseBody);
 });
 
 app.get('/auth/me', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, name, email, email_verified,
-       CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url,
-       total_paths, total_distance_meters, total_duration_seconds
-       FROM users WHERE id = $1`,
-      [req.userId]
-    );
-    const userNotFound = result.rows.length === 0;
-    if (userNotFound) {
-      res.status(404).json({ error: 'User not found' });
-      return;
-    }
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch user' });
+  let responseStatus = 0;
+  let responseBody: any = null;
+
+  const result = await safeQuery(
+    `SELECT id, name, email, email_verified,
+     CASE WHEN avatar_filename IS NOT NULL THEN '/uploads/' || avatar_filename END AS avatar_url,
+     total_paths, total_distance_meters, total_duration_seconds
+     FROM users WHERE id = $1`,
+    [req.userId]
+  );
+  if (result.error) {
+    responseStatus = 500;
+    responseBody = { error: 'Failed to fetch user' };
   }
+
+  if (responseStatus === 0) {
+    const userNotFound = result.value.rows.length === 0;
+    if (userNotFound) {
+      responseStatus = 404;
+      responseBody = { error: 'User not found' };
+    }
+  }
+
+  if (responseStatus === 0) {
+    responseStatus = 200;
+    responseBody = result.value.rows[0];
+  }
+
+  res.status(responseStatus).json(responseBody);
 });
 
 app.post('/auth/verify', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const { code } = req.body;
-    const isValid = typeof code === 'string' && code.length === 6;
-    if (!isValid) {
-      res.status(400).json({ error: 'A 6-digit code is required' });
-      return;
-    }
+  let responseStatus = 0;
+  let responseBody: any = null;
 
-    const result = await pool.query(
-      'SELECT verification_token, email_verified FROM users WHERE id = $1',
-      [req.userId]
-    );
-    const user = result.rows[0];
+  const { code } = req.body;
+
+  const result = await safeQuery(
+    'SELECT verification_token, email_verified FROM users WHERE id = $1',
+    [req.userId]
+  );
+  if (result.error) {
+    responseStatus = 500;
+    responseBody = { error: 'Verification failed' };
+  }
+
+  if (responseStatus === 0) {
+    const user = result.value.rows[0];
     const userNotFound = !user;
     if (userNotFound) {
-      res.status(404).json({ error: 'User not found' });
-      return;
+      responseStatus = 404;
+      responseBody = { error: 'User not found' };
     }
 
-    const alreadyVerified = user.email_verified;
+    const alreadyVerified = !userNotFound && user.email_verified;
     if (alreadyVerified) {
-      res.json({ email_verified: true });
-      return;
+      responseStatus = 200;
+      responseBody = { email_verified: true };
     }
 
-    const codeMatches = user.verification_token === code;
-    if (!codeMatches) {
-      res.status(400).json({ error: 'Invalid verification code' });
-      return;
+    const codeMatches = responseStatus === 0 && user.verification_token === code;
+    if (responseStatus === 0 && !codeMatches) {
+      responseStatus = 400;
+      responseBody = { error: 'Invalid verification code' };
     }
 
-    await pool.query(
-      'UPDATE users SET email_verified = TRUE, verification_token = NULL WHERE id = $1',
-      [req.userId]
-    );
-    res.json({ email_verified: true });
-  } catch (err) {
-    res.status(500).json({ error: 'Verification failed' });
+    if (responseStatus === 0) {
+      const updated = await safeQuery(
+        'UPDATE users SET email_verified = TRUE, verification_token = NULL WHERE id = $1',
+        [req.userId]
+      );
+      if (updated.error) {
+        responseStatus = 500;
+        responseBody = { error: 'Verification failed' };
+      }
+    }
+
+    if (responseStatus === 0) {
+      responseStatus = 200;
+      responseBody = { email_verified: true };
+    }
   }
+
+  res.status(responseStatus).json(responseBody);
 });
 
 app.post('/auth/resend-verification', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const result = await pool.query(
-      'SELECT email, email_verified FROM users WHERE id = $1',
-      [req.userId]
-    );
-    const user = result.rows[0];
+  let responseStatus = 0;
+  let responseBody: any = null;
+
+  const result = await safeQuery(
+    'SELECT email, email_verified FROM users WHERE id = $1',
+    [req.userId]
+  );
+  if (result.error) {
+    responseStatus = 500;
+    responseBody = { error: 'Failed to resend verification' };
+  }
+
+  if (responseStatus === 0) {
+    const user = result.value.rows[0];
     const userNotFound = !user;
     if (userNotFound) {
-      res.status(404).json({ error: 'User not found' });
-      return;
+      responseStatus = 404;
+      responseBody = { error: 'User not found' };
     }
 
-    const alreadyVerified = user.email_verified;
+    const alreadyVerified = !userNotFound && user.email_verified;
     if (alreadyVerified) {
-      res.json({ message: 'Already verified' });
-      return;
+      responseStatus = 200;
+      responseBody = { message: 'Already verified' };
     }
 
-    const newCode = generateVerificationCode();
-    await pool.query(
-      'UPDATE users SET verification_token = $1 WHERE id = $2',
-      [newCode, req.userId]
-    );
-    await sendVerificationEmail(user.email, newCode);
-    res.json({ message: 'Verification email sent' });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to resend verification' });
+    if (responseStatus === 0) {
+      const newCode = generateVerificationCode();
+      const updated = await safeQuery(
+        'UPDATE users SET verification_token = $1 WHERE id = $2',
+        [newCode, req.userId]
+      );
+      if (updated.error) {
+        responseStatus = 500;
+        responseBody = { error: 'Failed to resend verification' };
+      }
+
+      if (responseStatus === 0) {
+        await sendVerificationEmail(user.email, newCode);
+        responseStatus = 200;
+        responseBody = { message: 'Verification email sent' };
+      }
+    }
   }
+
+  res.status(responseStatus).json(responseBody);
 });
 
 const PATH_SELECT = `SELECT p.id, p.user_id, u.name AS user_name,
