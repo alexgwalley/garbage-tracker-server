@@ -19,8 +19,8 @@ vi.mock('bcryptjs', () => ({
   },
 }));
 
-const mockSendVerificationEmail = vi.fn();
-vi.mock('./email.js', () => ({
+const mockSendVerificationEmail = vi.fn(() => Promise.resolve({ value: '', error: null }));
+vi.mock('./email/email.js', () => ({
   sendVerificationEmail: mockSendVerificationEmail,
 }));
 

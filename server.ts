@@ -7,7 +7,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { encodePathList, encodeMarkerList } from './protobuf.js';
 import { hashPassword, verifyPassword, signToken, requireAuth, AuthRequest, generateVerificationCode, SafeResult } from './auth.js';
-import { sendVerificationEmail } from './email.js';
+import { sendVerificationEmail } from './email/email.js';
 import jwt from 'jsonwebtoken';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
