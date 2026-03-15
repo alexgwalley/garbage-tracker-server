@@ -58,6 +58,7 @@ async function safeQuery(text: string, params?: any[]): Promise<SafeResult<pg.Qu
     value = await pool.query(text, params);
   } catch (err) {
     error = `Query failed: ${err}`;
+    console.error(error);
   }
   const result: SafeResult<pg.QueryResult> = { value, error };
   return result;
