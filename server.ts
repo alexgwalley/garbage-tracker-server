@@ -35,6 +35,16 @@ const upload = multer({
 
 app.use('/uploads', express.static(uploadsDir));
 
+app.get('/.well-known/apple-app-site-association', (_req, res) => {
+  const aasa = {
+    webcredentials: {
+      apps: ['5R2369K5VG.com.alexwalley.garbage-tracker']
+    }
+  };
+  res.setHeader('Content-Type', 'application/json');
+  res.json(aasa);
+});
+
 const isProduction = !!process.env.RAILWAY_VOLUME_MOUNT_PATH;
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
